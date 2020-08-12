@@ -14,6 +14,8 @@
 
 #include "job_metadata.h"
 #include "libpq-fe.h"
+#include "postmaster/bgworker.h"
+#include "storage/dsm.h"
 #include "utils/timestamp.h"
 
 
@@ -29,6 +31,12 @@ typedef enum
 	CRON_TASK_ERROR = 7
 } CronTaskState;
 
+struct BackgroundWorkerHandle
+{
+	int slot;
+	uint64 generation;
+};
+
 typedef struct CronTask
 {
 	int64 jobId;
@@ -42,6 +50,8 @@ typedef struct CronTask
 	bool isActive;
 	char *errorMessage;
 	bool freeErrorMessage;
+	dsm_segment *seg;
+	BackgroundWorkerHandle handle;
 } CronTask;
 
 

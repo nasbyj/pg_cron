@@ -36,5 +36,6 @@ lib*.pc
 /autom4te.cache
 /Makefile.global
 /src/Makefile.custom
+/results
 
 pg_cron--?.?.sql

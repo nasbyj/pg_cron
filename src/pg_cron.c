@@ -20,6 +20,8 @@
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/proc.h"
+#include "storage/shm_mq.h"
+#include "storage/shm_toc.h"
 #include "storage/shmem.h"
 
 /* these headers are used by this particular worker's code */
@@ -39,19 +41,23 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/printtup.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/pg_extension.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "commands/async.h"
 #include "commands/dbcommands.h"
 #include "commands/extension.h"
 #include "commands/sequence.h"
 #include "commands/trigger.h"
 #include "lib/stringinfo.h"
 #include "libpq-fe.h"
+#include "libpq/pqmq.h"
 #include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
+#include "parser/analyze.h"
 #include "pgstat.h"
 #include "postmaster/postmaster.h"
 #include "utils/builtins.h"
@@ -59,17 +65,30 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/portal.h"
+#include "utils/ps_status.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 #if (PG_VERSION_NUM >= 100000)
 #include "utils/varlena.h"
 #endif
+#include "tcop/pquery.h"
 #include "tcop/utility.h"
 
 
 PG_MODULE_MAGIC;
+
+
+/* Table-of-contents constants for our dynamic shared memory segment. */
+#define PG_CRON_MAGIC			0x51028080
+#define PG_CRON_KEY_DATABASE	0
+#define PG_CRON_KEY_USERNAME	1
+#define PG_CRON_KEY_COMMAND		2
+#define PG_CRON_KEY_QUEUE		3
+#define PG_CRON_NKEYS			4
 
 
 /* ways in which the clock can change between main loop iterations */
@@ -87,7 +106,9 @@ void _PG_init(void);
 void _PG_fini(void);
 static void pg_cron_sigterm(SIGNAL_ARGS);
 static void pg_cron_sighup(SIGNAL_ARGS);
+static void pg_cron_background_worker_sigterm(SIGNAL_ARGS);
 void PgCronWorkerMain(Datum arg);
+void CronBackgroundWorker(Datum arg);
 
 static void StartAllPendingRuns(List *taskList, TimestampTz currentTime);
 static void StartPendingRuns(CronTask *task, ClockProgress clockProgress,
@@ -104,7 +125,10 @@ static void PollForTasks(List *taskList);
 static bool CanStartTask(CronTask *task);
 static void ManageCronTasks(List *taskList, TimestampTz currentTime);
 static void ManageCronTask(CronTask *task, TimestampTz currentTime);
+static void ExecuteSqlString(const char *sql);
 
+static bool jobCanceled(CronTask *task);
+static bool jobStartupTimeout(CronTask *task, TimestampTz currentTime);
 
 /* global settings */
 char *CronTableDatabaseName = "postgres";
@@ -120,6 +144,7 @@ static const int MaxWait = 1000; /* maximum time in ms that poll() can block */
 static bool RebootJobsScheduled = false;
 static int RunningTaskCount = 0;
 static int MaxRunningTasks = 0;
+static bool UseBackgroundWorkers = false;
 
 
 /*
@@ -177,9 +202,19 @@ _PG_init(void)
 	DefineCustomStringVariable(
 		"cron.host",
 		gettext_noop("Hostname to connect to postgres."),
-		NULL,
+		gettext_noop("This setting has no effect when background workers are used."),
 		&CronHost,
 		"localhost",
+		PGC_POSTMASTER,
+		GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+
+	DefineCustomBoolVariable(
+		"cron.use_background_workers",
+		gettext_noop("Use background workers instead of client sessions."),
+		NULL,
+		&UseBackgroundWorkers,
+		false,
 		PGC_POSTMASTER,
 		GUC_SUPERUSER_ONLY,
 		NULL, NULL, NULL);
@@ -234,6 +269,30 @@ pg_cron_sighup(SIGNAL_ARGS)
 	{
 		SetLatch(&MyProc->procLatch);
 	}
+}
+
+
+/*
+ * Signal handler for SIGTERM for background workers
+ * 		When we receive a SIGTERM, we set InterruptPending and ProcDiePending
+ * 		just like a normal backend.  The next CHECK_FOR_INTERRUPTS() will do the
+ * 		right thing.
+ */
+static void
+pg_cron_background_worker_sigterm(SIGNAL_ARGS)
+{
+	int save_errno = errno;
+
+	if (MyProc)
+		SetLatch(&MyProc->procLatch);
+
+	if (!proc_exit_inprogress)
+	{
+		InterruptPending = true;
+		ProcDiePending = true;
+	}
+
+	errno = save_errno;
 }
 
 
@@ -915,62 +974,192 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 
 		case CRON_TASK_START:
 		{
-			const char *clientEncoding = GetDatabaseEncodingName();
-			char nodePortString[12];
-			TimestampTz startDeadline = 0;
-
-			const char *keywordArray[] = {
-				"host",
-				"port",
-				"fallback_application_name",
-				"client_encoding",
-				"dbname",
-				"user",
-				NULL
-			};
-			const char *valueArray[] = {
-				cronJob->nodeName,
-				nodePortString,
-				"pg_cron",
-				clientEncoding,
-				cronJob->database,
-				cronJob->userName,
-				NULL
-			};
-			sprintf(nodePortString, "%d", cronJob->nodePort);
-
-			Assert(sizeof(keywordArray) == sizeof(valueArray));
-
-			if (CronLogStatement)
+			if (UseBackgroundWorkers)
 			{
-				char *command = cronJob->command;
+				BackgroundWorker worker;
+				pid_t pid;
+				shm_toc_estimator e;
+				shm_toc *toc;
+				char *database;
+				char *username;
+				char *command;
+				MemoryContext oldcontext;
+				shm_mq_handle *responseq;
+				shm_mq *mq;
+				Size segsize;
+				BackgroundWorkerHandle *handle;
+				BgwHandleStatus status;
 
-				ereport(LOG, (errmsg("cron job " INT64_FORMAT " starting: %s",
-									 jobId, command)));
+				// TODO: make configurable
+				#define QUEUE_SIZE ((Size) 65536)
+
+				/*
+				 * Create the shared memory that we will pass to the background
+				 * worker process.  We use DSM_CREATE_NULL_IF_MAXSEGMENTS so that we
+				 * do not ERROR here.  This way, we can mark the job as failed and
+				 * keep the launcher process running normally.
+				 */
+				shm_toc_initialize_estimator(&e);
+				shm_toc_estimate_chunk(&e, strlen(cronJob->database) + 1);
+				shm_toc_estimate_chunk(&e, strlen(cronJob->userName) + 1);
+				shm_toc_estimate_chunk(&e, strlen(cronJob->command) + 1);
+				shm_toc_estimate_chunk(&e, QUEUE_SIZE);
+				shm_toc_estimate_keys(&e, PG_CRON_NKEYS);
+				segsize = shm_toc_estimate(&e);
+
+				task->seg = dsm_create(segsize, DSM_CREATE_NULL_IF_MAXSEGMENTS);
+				if (task->seg == NULL)
+				{
+					/*
+					 * TODO: I think we need to move to CRON_TASK_ERROR here, but
+					 * I'm not sure how the actual error string should get carried
+					 * over yet.
+					 */
+
+					break;
+				}
+
+				toc = shm_toc_create(PG_CRON_MAGIC, dsm_segment_address(task->seg), segsize);
+
+				database = shm_toc_allocate(toc, strlen(cronJob->database) + 1);
+				strcpy(database, cronJob->database);
+				shm_toc_insert(toc, PG_CRON_KEY_DATABASE, database);
+
+				username = shm_toc_allocate(toc, strlen(cronJob->userName) + 1);
+				strcpy(username, cronJob->userName);
+				shm_toc_insert(toc, PG_CRON_KEY_USERNAME, username);
+
+				command = shm_toc_allocate(toc, strlen(cronJob->command) + 1);
+				strcpy(command, cronJob->command);
+				shm_toc_insert(toc, PG_CRON_KEY_COMMAND, command);
+
+				mq = shm_mq_create(shm_toc_allocate(toc, QUEUE_SIZE), QUEUE_SIZE);
+				shm_toc_insert(toc, PG_CRON_KEY_QUEUE, mq);
+				shm_mq_set_receiver(mq, MyProc);
+
+				/*
+				 * Attach the queue before launching a worker, so that we'll automatically
+				 * detach the queue if we error out.  (Otherwise, the worker might sit
+				 * there trying to write the queue long after we've gone away.)
+				 */
+				oldcontext = MemoryContextSwitchTo(TopMemoryContext);
+				responseq = shm_mq_attach(mq, task->seg, NULL);
+				MemoryContextSwitchTo(oldcontext);
+
+				/*
+				 * Prepare the background worker.
+				 *
+				 * TODO: Do we need to add some way to reference the process to a
+				 * queue here?
+				 */
+				memset(&worker, 0, sizeof(BackgroundWorker));
+				worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+				worker.bgw_start_time = BgWorkerStart_ConsistentState;
+				worker.bgw_restart_time = BGW_NEVER_RESTART;
+				sprintf(worker.bgw_library_name, "pg_cron");
+				sprintf(worker.bgw_function_name, "CronBackgroundWorker");
+				snprintf(worker.bgw_type, BGW_MAXLEN, "pg_cron");
+				snprintf(worker.bgw_name, BGW_MAXLEN, "pg_cron worker");
+				worker.bgw_main_arg = UInt32GetDatum(dsm_segment_handle(task->seg));
+				worker.bgw_notify_pid = MyProcPid;
+
+				/*
+				 * Start the worker process.
+				 */
+				if (!RegisterDynamicBackgroundWorker(&worker, &handle))
+				{
+					dsm_detach(task->seg);
+					task->seg = NULL;
+					task->state = CRON_TASK_ERROR;
+					task->errorMessage = "could not start background process; more "
+										 "details may be available in the server log";
+					break;
+				}
+
+				/*
+				 * TODO: The only way I could get this working quickly was to copy
+				 * all of the content of the handle straight into the task struct.
+				 * I'd wager this is because RegisterDynamicBackgroundWorker()
+				 * pallocs the handle data and we aren't in any sort of memory
+				 * context.  This is probably reasonably easy to fix, but this hack
+				 * will do for now.
+				 */
+				memcpy(&task->handle, handle, sizeof(BackgroundWorkerHandle));
+
+				status = WaitForBackgroundWorkerStartup(&task->handle, &pid);
+				if (status != BGWH_STARTED && status != BGWH_STOPPED)
+				{
+					dsm_detach(task->seg);
+					task->seg = NULL;
+					task->state = CRON_TASK_ERROR;
+					task->errorMessage = "could not start background process; more "
+										 "details may be available in the server log";
+					break;
+				}
+
+				dsm_pin_mapping(task->seg);	// TODO: I'm not sure we actually need this
+
+				task->state = CRON_TASK_RUNNING;
 			}
-
-			connection = PQconnectStartParams(keywordArray, valueArray, false);
-			PQsetnonblocking(connection, 1);
-
-			connectionStatus = PQstatus(connection);
-			if (connectionStatus == CONNECTION_BAD)
+			else
 			{
-				/* make sure we call PQfinish on the connection */
+				const char *clientEncoding = GetDatabaseEncodingName();
+				char nodePortString[12];
+				TimestampTz startDeadline = 0;
+
+				const char *keywordArray[] = {
+					"host",
+					"port",
+					"fallback_application_name",
+					"client_encoding",
+					"dbname",
+					"user",
+					NULL
+					};
+				const char *valueArray[] = {
+					cronJob->nodeName,
+					nodePortString,
+					"pg_cron",
+					clientEncoding,
+					cronJob->database,
+					cronJob->userName,
+					NULL
+				};
+				sprintf(nodePortString, "%d", cronJob->nodePort);
+
+				Assert(sizeof(keywordArray) == sizeof(valueArray));
+
+				if (CronLogStatement)
+				{
+					char *command = cronJob->command;
+
+					ereport(LOG, (errmsg("cron job " INT64_FORMAT " starting: %s",
+										 jobId, command)));
+				}
+
+				connection = PQconnectStartParams(keywordArray, valueArray, false);
+				PQsetnonblocking(connection, 1);
+
+				connectionStatus = PQstatus(connection);
+				if (connectionStatus == CONNECTION_BAD)
+				{
+					/* make sure we call PQfinish on the connection */
+					task->connection = connection;
+
+					task->errorMessage = "connection failed";
+					task->pollingStatus = 0;
+					task->state = CRON_TASK_ERROR;
+					break;
+				}
+
+				startDeadline = TimestampTzPlusMilliseconds(currentTime,
+															CronTaskStartTimeout);
+
+				task->startDeadline = startDeadline;
 				task->connection = connection;
-
-				task->errorMessage = "connection failed";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
+				task->pollingStatus = PGRES_POLLING_WRITING;
+				task->state = CRON_TASK_CONNECTING;
 			}
-
-			startDeadline = TimestampTzPlusMilliseconds(currentTime,
-														CronTaskStartTimeout);
-
-			task->startDeadline = startDeadline;
-			task->connection = connection;
-			task->pollingStatus = PGRES_POLLING_WRITING;
-			task->state = CRON_TASK_CONNECTING;
 
 			break;
 		}
@@ -979,23 +1168,15 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 		{
 			PostgresPollingStatusType pollingStatus = 0;
 
+			Assert(!UseBackgroundWorkers);
+
 			/* check if job has been removed */
-			if (!task->isActive)
-			{
-				task->errorMessage = "job cancelled";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+			if (jobCanceled(task))
+                    break;
 
 			/* check if timeout has been reached */
-			if (TimestampDifferenceExceeds(task->startDeadline, currentTime, 0))
-			{
-				task->errorMessage = "connection timeout";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+            if (jobStartupTimeout(task, currentTime))
+                break;
 
 			/* check if connection is still alive */
 			connectionStatus = PQstatus(connection);
@@ -1048,23 +1229,15 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 			char *command = cronJob->command;
 			int sendResult = 0;
 
+			Assert(!UseBackgroundWorkers);
+
 			/* check if job has been removed */
-			if (!task->isActive)
-			{
-				task->errorMessage = "job cancelled";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+			if (jobCanceled(task))
+                    break;
 
 			/* check if timeout has been reached */
-			if (TimestampDifferenceExceeds(task->startDeadline, currentTime, 0))
-			{
-				task->errorMessage = "connection timeout";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+            if (jobStartupTimeout(task, currentTime))
+                break;
 
 			/* check if socket is ready to send */
 			if (!task->isSocketReady)
@@ -1102,123 +1275,141 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 
 		case CRON_TASK_RUNNING:
 		{
-			int connectionBusy = 0;
-			PGresult *result = NULL;
-
-			/* check if job has been removed */
-			if (!task->isActive)
+			if (UseBackgroundWorkers)
 			{
-				task->errorMessage = "job cancelled";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
+				pid_t pid;
 
-			/* check if connection is still alive */
-			connectionStatus = PQstatus(connection);
-			if (connectionStatus == CONNECTION_BAD)
-			{
-				task->errorMessage = "connection lost";
-				task->pollingStatus = 0;
-				task->state = CRON_TASK_ERROR;
-				break;
-			}
-
-			/* check if socket is ready to send */
-			if (!task->isSocketReady)
-			{
-				break;
-			}
-
-			PQconsumeInput(connection);
-
-			connectionBusy = PQisBusy(connection);
-			if (connectionBusy)
-			{
-				/* still waiting for results */
-				break;
-			}
-
-			while ((result = PQgetResult(connection)) != NULL)
-			{
-				ExecStatusType executionStatus = PQresultStatus(result);
-
-				switch (executionStatus)
+				/* check if job has been removed */
+				if (jobCanceled(task))
 				{
-					case PGRES_COMMAND_OK:
-					{
-						if (CronLogStatement)
-						{
-							char *cmdStatus = PQcmdStatus(result);
-							char *cmdTuples = PQcmdTuples(result);
+					TerminateBackgroundWorker(&task->handle);
+					WaitForBackgroundWorkerShutdown(&task->handle);
+					dsm_unpin_mapping(task->seg);
+					dsm_detach(task->seg);
+					task->seg = NULL;
 
-							ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: %s %s",
-												 jobId, cmdStatus, cmdTuples)));
-						}
-
-						break;
-					}
-
-					case PGRES_BAD_RESPONSE:
-					case PGRES_FATAL_ERROR:
-					{
-						task->errorMessage = strdup(PQresultErrorMessage(result));
-						task->freeErrorMessage = true;
-						task->pollingStatus = 0;
-						task->state = CRON_TASK_ERROR;
-
-						PQclear(result);
-
-						return;
-					}
-
-					case PGRES_COPY_IN:
-					case PGRES_COPY_OUT:
-					case PGRES_COPY_BOTH:
-					{
-						/* cannot handle COPY input/output */
-						task->errorMessage = "COPY not supported";
-						task->pollingStatus = 0;
-						task->state = CRON_TASK_ERROR;
-
-						PQclear(result);
-
-						return;
-					}
-
-					case PGRES_TUPLES_OK:
-					case PGRES_EMPTY_QUERY:
-					case PGRES_SINGLE_TUPLE:
-					case PGRES_NONFATAL_ERROR:
-					default:
-					{
-						if (CronLogStatement)
-						{
-							int tupleCount = PQntuples(result);
-							char *rowString = ngettext("row", "rows",
-													   tupleCount);
-
-							ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: "
-												 "%d %s",
-												 jobId, tupleCount,
-												 rowString)));
-						}
-
-						break;
-					}
-
+					break;
 				}
 
-				PQclear(result);
+				/* still waiting for job to complete */
+				if (GetBackgroundWorkerPid(&task->handle, &pid) != BGWH_STOPPED)
+					break;
+			}
+			else
+			{
+				int connectionBusy = 0;
+				PGresult *result = NULL;
+
+				/* check if job has been removed */
+				if (jobCanceled(task))
+                    break;
+
+				/* check if connection is still alive */
+				connectionStatus = PQstatus(connection);
+				if (connectionStatus == CONNECTION_BAD)
+				{
+					task->errorMessage = "connection lost";
+					task->pollingStatus = 0;
+					task->state = CRON_TASK_ERROR;
+					break;
+				}
+
+				/* check if socket is ready to send */
+				if (!task->isSocketReady)
+				{
+					break;
+				}
+
+				PQconsumeInput(connection);
+
+				connectionBusy = PQisBusy(connection);
+				if (connectionBusy)
+				{
+					/* still waiting for results */
+					break;
+				}
+
+				while ((result = PQgetResult(connection)) != NULL)
+				{
+					ExecStatusType executionStatus = PQresultStatus(result);
+
+					switch (executionStatus)
+					{
+						case PGRES_COMMAND_OK:
+						{
+							if (CronLogStatement)
+							{
+								char *cmdStatus = PQcmdStatus(result);
+								char *cmdTuples = PQcmdTuples(result);
+
+								ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: %s %s",
+													 jobId, cmdStatus, cmdTuples)));
+							}
+
+							break;
+						}
+
+						case PGRES_BAD_RESPONSE:
+						case PGRES_FATAL_ERROR:
+						{
+							task->errorMessage = strdup(PQresultErrorMessage(result));
+							task->freeErrorMessage = true;
+							task->pollingStatus = 0;
+							task->state = CRON_TASK_ERROR;
+
+							PQclear(result);
+
+							return;
+						}
+
+						case PGRES_COPY_IN:
+						case PGRES_COPY_OUT:
+						case PGRES_COPY_BOTH:
+						{
+							/* cannot handle COPY input/output */
+							task->errorMessage = "COPY not supported";
+							task->pollingStatus = 0;
+							task->state = CRON_TASK_ERROR;
+
+							PQclear(result);
+
+							return;
+						}
+
+						case PGRES_TUPLES_OK:
+						case PGRES_EMPTY_QUERY:
+						case PGRES_SINGLE_TUPLE:
+						case PGRES_NONFATAL_ERROR:
+						default:
+						{
+							if (CronLogStatement)
+							{
+								int tupleCount = PQntuples(result);
+								char *rowString = ngettext("row", "rows",
+														   tupleCount);
+
+								ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: "
+													 "%d %s",
+													 jobId, tupleCount,
+													 rowString)));
+							}
+
+							break;
+						}
+
+					}
+
+					PQclear(result);
+				}
+
+				PQfinish(connection);
+
+				task->connection = NULL;
+				task->pollingStatus = 0;
+				task->isSocketReady = false;
 			}
 
-			PQfinish(connection);
-
-			task->connection = NULL;
-			task->pollingStatus = 0;
-			task->isSocketReady = false;
 			task->state = CRON_TASK_DONE;
-
 			RunningTaskCount--;
 
 			break;
@@ -1268,4 +1459,320 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 		}
 
 	}
+}
+
+/*
+ * Background worker logic.
+ */
+void
+CronBackgroundWorker(Datum main_arg)
+{
+	dsm_segment *seg;
+	shm_toc *toc;
+	char *database;
+	char *username;
+	char *command;
+	shm_mq *mq;
+	shm_mq_handle *responseq;
+
+	pqsignal(SIGTERM, pg_cron_background_worker_sigterm);
+	BackgroundWorkerUnblockSignals();
+
+	/* Set up a memory context and resource owner. */
+	Assert(CurrentResourceOwner == NULL);
+	CurrentResourceOwner = ResourceOwnerCreate(NULL, "pg_cron");
+	CurrentMemoryContext = AllocSetContextCreate(TopMemoryContext,
+												 "pg_cron session",
+												 ALLOCSET_DEFAULT_MINSIZE,
+												 ALLOCSET_DEFAULT_INITSIZE,
+												 ALLOCSET_DEFAULT_MAXSIZE);
+
+	/* Set up a dynamic shared memory segment. */
+	seg = dsm_attach(DatumGetInt32(main_arg));
+	if (seg == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("unable to map dynamic shared memory segment")));
+	toc = shm_toc_attach(PG_CRON_MAGIC, dsm_segment_address(seg));
+	if (toc == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			   errmsg("bad magic number in dynamic shared memory segment")));
+
+	database = shm_toc_lookup(toc, PG_CRON_KEY_DATABASE, false);
+	username = shm_toc_lookup(toc, PG_CRON_KEY_USERNAME, false);
+	command = shm_toc_lookup(toc, PG_CRON_KEY_COMMAND, false);
+	mq = shm_toc_lookup(toc, PG_CRON_KEY_QUEUE, false);
+
+	shm_mq_set_sender(mq, MyProc);
+	responseq = shm_mq_attach(mq, seg, NULL);
+	pq_redirect_to_shm_mq(seg, responseq);
+
+	BackgroundWorkerInitializeConnection(database, username, 0);
+
+	/* Prepare to execute the query. */
+	SetCurrentStatementStartTimestamp();
+	debug_query_string = command;
+	pgstat_report_activity(STATE_RUNNING, command);
+	StartTransactionCommand();
+	if (StatementTimeout > 0)
+		enable_timeout_after(STATEMENT_TIMEOUT, StatementTimeout);
+	else
+		disable_timeout(STATEMENT_TIMEOUT, false);
+
+	/* Execute the query. */
+	ExecuteSqlString(command);
+
+	/* Post-execution cleanup. */
+	disable_timeout(STATEMENT_TIMEOUT, false);
+	CommitTransactionCommand();
+	ProcessCompletedNotifies();
+	pgstat_report_activity(STATE_IDLE, command);
+	pgstat_report_stat(true);
+
+	/* Signal that we are done. */
+	ReadyForQuery(DestRemote);
+
+	dsm_detach(seg);
+	proc_exit(1);
+}
+
+/*
+ * Execute given SQL string without SPI or a libpq session.
+ */
+static void
+ExecuteSqlString(const char *sql)
+{
+	List *raw_parsetree_list;
+	ListCell *lc1;
+	bool isTopLevel;
+	int commands_remaining;
+	MemoryContext parsecontext;
+	MemoryContext oldcontext;
+
+	/*
+	 * Parse the SQL string into a list of raw parse trees.
+	 *
+	 * Because we allow statements that perform internal transaction control,
+	 * we can't do this in TopTransactionContext; the parse trees might get
+	 * blown away before we're done executing them.
+	 */
+	parsecontext = AllocSetContextCreate(TopMemoryContext,
+										 "pg_cron parse/plan",
+										 ALLOCSET_DEFAULT_MINSIZE,
+										 ALLOCSET_DEFAULT_INITSIZE,
+										 ALLOCSET_DEFAULT_MAXSIZE);
+	oldcontext = MemoryContextSwitchTo(parsecontext);
+	raw_parsetree_list = pg_parse_query(sql);
+	commands_remaining = list_length(raw_parsetree_list);
+	isTopLevel = commands_remaining == 1;
+	MemoryContextSwitchTo(oldcontext);
+
+	/*
+	 * Do parse analysis, rule rewrite, planning, and execution for each raw
+	 * parsetree.  We must fully execute each query before beginning parse
+	 * analysis on the next one, since there may be interdependencies.
+	 */
+	foreach(lc1, raw_parsetree_list)
+	{
+		#if PG_VERSION_NUM < 100000
+			Node *parsetree = (Node *) lfirst(lc1);
+		#else
+			RawStmt *parsetree = (RawStmt *)  lfirst(lc1);
+		#endif
+
+		#if PG_VERSION_NUM < 130000
+			const char *commandTag;
+			char completionTag[COMPLETION_TAG_BUFSIZE];
+		#else
+			CommandTag commandTag;
+			QueryCompletion qc;
+		#endif
+
+		List *querytree_list;
+		List *plantree_list;
+		bool snapshot_set = false;
+		Portal portal;
+		DestReceiver *receiver;
+		int16 format = 1;
+
+		/*
+		 * We don't allow transaction-control commands like COMMIT and ABORT
+		 * here.  The entire SQL statement is executed as a single transaction
+		 * which commits if no errors are encountered.
+		 */
+		if (IsA(parsetree, TransactionStmt))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("transaction control statements are not allowed in pg_cron")));
+
+		/*
+		 * Get the command name for use in status display (it also becomes the
+		 * default completion tag, down inside PortalRun).  Set ps_status and
+		 * do any special start-of-SQL-command processing needed by the
+		 * destination.
+		 */
+		#if PG_VERSION_NUM < 100000
+			commandTag = CreateCommandTag(parsetree);
+		#else
+			commandTag = CreateCommandTag(parsetree->stmt);
+		#endif
+
+		#if PG_VERSION_NUM < 130000
+			set_ps_display(commandTag, false);
+		#else
+			set_ps_display(GetCommandTagName(commandTag), false);
+		#endif
+
+		BeginCommand(commandTag, DestNone);
+
+		/* Set up a snapshot if parse analysis/planning will need one. */
+		if (analyze_requires_snapshot(parsetree))
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			snapshot_set = true;
+		}
+
+		/*
+		 * OK to analyze, rewrite, and plan this query.
+		 *
+		 * As with parsing, we need to make sure this data outlives the
+		 * transaction, because of the possibility that the statement might
+		 * perform internal transaction control.
+		 */
+		oldcontext = MemoryContextSwitchTo(parsecontext);
+		#if PG_VERSION_NUM >= 100000
+			querytree_list = pg_analyze_and_rewrite(parsetree, sql, NULL, 0,NULL);
+		#else
+			querytree_list = pg_analyze_and_rewrite(parsetree, sql, NULL, 0);
+		#endif
+
+		plantree_list = pg_plan_queries(querytree_list, 0, NULL);
+
+		/* Done with the snapshot used for parsing/planning */
+		if (snapshot_set)
+			PopActiveSnapshot();
+
+		/* If we got a cancel signal in analysis or planning, quit */
+		CHECK_FOR_INTERRUPTS();
+
+		/*
+		 * Execute the query using the unnamed portal.
+		 */
+		portal = CreatePortal("", true, true);
+		/* Don't display the portal in pg_cursors */
+		portal->visible = false;
+		PortalDefineQuery(portal, NULL, sql, commandTag, plantree_list, NULL);
+		PortalStart(portal, NULL, 0, InvalidSnapshot);
+		PortalSetResultFormat(portal, 1, &format);		/* binary format */
+
+		/*
+		 * Tuples returned by any command other than the last are simply
+		 * discarded; but those returned by the last (or only) command are
+		 * redirected to the shared memory queue we're using for communication
+		 * with the launching backend. If the launching backend is gone or has
+		 * detached us, these messages will just get dropped on the floor.
+		 */
+		--commands_remaining;
+		if (commands_remaining > 0)
+			receiver = CreateDestReceiver(DestNone);
+		else
+		{
+			receiver = CreateDestReceiver(DestRemote);
+			SetRemoteDestReceiverParams(receiver, portal);
+		}
+
+		/*
+		 * Only once the portal and destreceiver have been established can
+		 * we return to the transaction context.  All that stuff needs to
+		 * survive an internal commit inside PortalRun!
+		 */
+		MemoryContextSwitchTo(oldcontext);
+
+		/* Here's where we actually execute the command. */
+		#if PG_VERSION_NUM < 100000
+			(void) PortalRun(portal, FETCH_ALL, isTopLevel, receiver, receiver, completionTag);
+		#elif PG_VERSION_NUM < 130000
+			(void) PortalRun(portal, FETCH_ALL, isTopLevel,true, receiver, receiver, completionTag);
+		#else
+			(void) PortalRun(portal, FETCH_ALL, isTopLevel, true, receiver, receiver, &qc);
+		#endif
+
+		/* Clean up the receiver. */
+		(*receiver->rDestroy) (receiver);
+
+		/*
+		 * Send a CommandComplete message even if we suppressed the query
+		 * results.  The user backend will report these in the absence of
+		 * any true query results.
+		 */
+		#if PG_VERSION_NUM < 130000
+			EndCommand(completionTag, DestRemote);
+		#else
+			EndCommand(&qc, DestRemote, false);	// TODO: check last argument
+		#endif
+
+		/* Clean up the portal. */
+		PortalDrop(portal, false);
+	}
+
+	/* Be sure to advance the command counter after the last script command */
+	CommandCounterIncrement();
+}
+
+/*
+ * If a task is not marked as active, set an appropriate error state on the task
+ * and return true. Note that this should only be called after a task has
+ * already been launched.
+ */
+static bool
+jobCanceled(CronTask *task)
+{
+    CronTaskState state = task->state;
+
+    Assert(state == CRON_TASK_CONNECTING || \
+            state == CRON_TASK_SENDING || \
+            state == CRON_TASK_RUNNING);
+
+    if (task->isActive)
+        return false;
+    else
+    {
+        /* Use the American spelling for consistency with PG code. */
+        task->errorMessage = "job canceled";
+        task->state = CRON_TASK_ERROR;
+
+        /*
+         * Technically, pollingStatus is only used by when UseBackgroundWorkers
+         * is false, but no damage in setting it in both cases.
+         */
+        task->pollingStatus = 0;
+        return true;
+    }
+}
+
+/*
+ * If a task has hit it's startup deadline, set an appropriate error state on
+ * the task and return true. Note that this should only be called after a task
+ * has already been launched. It's not used when UseBackgroundWorkers is true
+ * (if that were to change the error message wouldn't make sense).
+ */
+static bool
+jobStartupTimeout(CronTask *task, TimestampTz currentTime)
+{
+    CronTaskState state = task->state;
+
+    Assert(!UseBackgroundWorkers);
+    Assert(state == CRON_TASK_CONNECTING || \
+            state == CRON_TASK_SENDING);
+
+    if (TimestampDifferenceExceeds(task->startDeadline, currentTime, 0))
+    {
+        task->errorMessage = "connection timeout";
+        task->pollingStatus = 0;
+        task->state = CRON_TASK_ERROR;
+        return true;
+    }
+    else
+        return false;
 }
