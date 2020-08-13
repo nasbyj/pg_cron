@@ -77,6 +77,7 @@
 #endif
 #include "tcop/pquery.h"
 #include "tcop/utility.h"
+#include "libpq/pqformat.h"
 
 
 PG_MODULE_MAGIC;
@@ -89,7 +90,7 @@ PG_MODULE_MAGIC;
 #define PG_CRON_KEY_COMMAND		2
 #define PG_CRON_KEY_QUEUE		3
 #define PG_CRON_NKEYS			4
-
+#define PG_CRON_KEY_FDATA		5 
 
 /* ways in which the clock can change between main loop iterations */
 typedef enum
@@ -100,6 +101,11 @@ typedef enum
 	CLOCK_CHANGE = 3
 } ClockProgress;
 
+/* Fixed-size data passed via our dynamic shared memory segment. */
+typedef struct pg_cron_fixed_data
+{
+        int64  jobid;
+} pg_cron_fixed_data;
 
 /* forward declarations */
 void _PG_init(void);
@@ -125,10 +131,12 @@ static void PollForTasks(List *taskList);
 static bool CanStartTask(CronTask *task);
 static void ManageCronTasks(List *taskList, TimestampTz currentTime);
 static void ManageCronTask(CronTask *task, TimestampTz currentTime);
-static void ExecuteSqlString(const char *sql);
+static void ExecuteSqlString(const char *sql, int64 jobid);
+static void GetBackgroundWorkerFeedback(shm_mq_handle *responseq, int64 jobid);
 
 static bool jobCanceled(CronTask *task);
 static bool jobStartupTimeout(CronTask *task, TimestampTz currentTime);
+static char* pg_cron_cmdTuples(char *msg);
 
 /* global settings */
 char *CronTableDatabaseName = "postgres";
@@ -271,6 +279,61 @@ pg_cron_sighup(SIGNAL_ARGS)
 	}
 }
 
+/*
+ * pg_cron_cmdTuples -
+ *      If the last command was INSERT/UPDATE/DELETE/MOVE/FETCH/COPY, return
+ *      a string containing the number of inserted/affected tuples. If not,
+ *      return "".
+ *
+ *      XXX: this should probably return an int
+ */
+
+static char *
+pg_cron_cmdTuples(char *msg)
+{
+        char       *p,
+                           *c;
+
+        if (!msg)
+                return "";
+
+        if (strncmp(msg, "INSERT ", 7) == 0)
+        {
+                p = msg + 7;
+                /* INSERT: skip oid and space */
+                while (*p && *p != ' ')
+                        p++;
+                if (*p == 0)
+                        goto interpret_error;   /* no space? */
+                p++;
+        }
+        else if (strncmp(msg, "SELECT ", 7) == 0 ||
+                         strncmp(msg, "DELETE ", 7) == 0 ||
+                         strncmp(msg, "UPDATE ", 7) == 0)
+                p = msg + 7;
+        else if (strncmp(msg, "FETCH ", 6) == 0)
+                p = msg + 6;
+        else if (strncmp(msg, "MOVE ", 5) == 0 ||
+                         strncmp(msg, "COPY ", 5) == 0)
+                p = msg + 5;
+        else
+                return "";
+
+        /* check that we have an integer (at least one digit, nothing else) */
+        for (c = p; *c; c++)
+        {
+                if (!isdigit((unsigned char) *c))
+                        goto interpret_error;
+        }
+        if (c == p)
+                goto interpret_error;
+
+        return p;
+
+interpret_error:
+	ereport(LOG, (errmsg("could not interpret result from server: %s", msg)));
+        return "";
+}
 
 /*
  * Signal handler for SIGTERM for background workers
@@ -983,6 +1046,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				char *database;
 				char *username;
 				char *command;
+				int64 *jobid;
 				MemoryContext oldcontext;
 				shm_mq_handle *responseq;
 				shm_mq *mq;
@@ -1003,6 +1067,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				shm_toc_estimate_chunk(&e, strlen(cronJob->database) + 1);
 				shm_toc_estimate_chunk(&e, strlen(cronJob->userName) + 1);
 				shm_toc_estimate_chunk(&e, strlen(cronJob->command) + 1);
+				shm_toc_estimate_chunk(&e, sizeof(pg_cron_fixed_data));
 				shm_toc_estimate_chunk(&e, QUEUE_SIZE);
 				shm_toc_estimate_keys(&e, PG_CRON_NKEYS);
 				segsize = shm_toc_estimate(&e);
@@ -1015,6 +1080,9 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 					 * I'm not sure how the actual error string should get carried
 					 * over yet.
 					 */
+					task->state = CRON_TASK_ERROR;
+					task->errorMessage = "unable to create a DSM segment; more "
+									"details may be available in the server log";
 
 					break;
 				}
@@ -1032,6 +1100,11 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				command = shm_toc_allocate(toc, strlen(cronJob->command) + 1);
 				strcpy(command, cronJob->command);
 				shm_toc_insert(toc, PG_CRON_KEY_COMMAND, command);
+
+				pg_cron_fixed_data *fdata;
+				fdata = shm_toc_allocate(toc, sizeof(pg_cron_fixed_data));
+				fdata->jobid = jobId;
+				shm_toc_insert(toc, PG_CRON_KEY_FDATA, fdata);
 
 				mq = shm_mq_create(shm_toc_allocate(toc, QUEUE_SIZE), QUEUE_SIZE);
 				shm_toc_insert(toc, PG_CRON_KEY_QUEUE, mq);
@@ -1066,6 +1139,8 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				/*
 				 * Start the worker process.
 				 */
+				ereport(LOG, (errmsg("cron job " INT64_FORMAT " starting: %s",
+										 jobId, command)));
 				if (!RegisterDynamicBackgroundWorker(&worker, &handle))
 				{
 					dsm_detach(task->seg);
@@ -1084,8 +1159,8 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				 * context.  This is probably reasonably easy to fix, but this hack
 				 * will do for now.
 				 */
-				memcpy(&task->handle, handle, sizeof(BackgroundWorkerHandle));
-
+				//memcpy(&task->handle, handle, sizeof(BackgroundWorkerHandle));
+				task->handle = *handle;
 				status = WaitForBackgroundWorkerStartup(&task->handle, &pid);
 				if (status != BGWH_STARTED && status != BGWH_STOPPED)
 				{
@@ -1294,6 +1369,15 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 				/* still waiting for job to complete */
 				if (GetBackgroundWorkerPid(&task->handle, &pid) != BGWH_STOPPED)
 					break;
+
+				shm_mq_handle *responseq;
+				shm_mq *mq;
+				shm_toc *toc;
+				toc = shm_toc_attach(PG_CRON_MAGIC, dsm_segment_address(task->seg));
+				mq = shm_toc_lookup(toc, PG_CRON_KEY_QUEUE, false);
+				responseq = shm_mq_attach(mq, task->seg, NULL);
+				GetBackgroundWorkerFeedback(responseq, task->jobId);
+				//ereport(LOG, errmsg("BDT job " INT64_FORMAT " completed", task->jobId));
 			}
 			else
 			{
@@ -1342,7 +1426,7 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 								char *cmdStatus = PQcmdStatus(result);
 								char *cmdTuples = PQcmdTuples(result);
 
-								ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: %s %s",
+								ereport(LOG, (errmsg("cron job " INT64_FORMAT " COMMAND completed: %s %s",
 													 jobId, cmdStatus, cmdTuples)));
 							}
 
@@ -1461,6 +1545,69 @@ ManageCronTask(CronTask *task, TimestampTz currentTime)
 	}
 }
 
+static void 
+GetBackgroundWorkerFeedback(shm_mq_handle *responseq, int64 jobid)
+{
+
+  	Size            nbytes;
+	void       *data;	
+	shm_mq_result   res;
+	char            msgtype;
+	StringInfoData  msg;
+
+	/*
+	 * Message-parsing routines operate on a null-terminated StringInfo,
+ 	 * so we must construct one.
+ 	 */	
+  	res = shm_mq_receive(responseq, &nbytes, &data, false);
+	initStringInfo(&msg);
+	resetStringInfo(&msg);
+	enlargeStringInfo(&msg, nbytes);
+	msg.len = nbytes;
+	memcpy(msg.data, data, nbytes);
+	msg.data[nbytes] = '\0';
+	//ereport(LOG,(errmsg("BDT message avec type est %s",msg.data)));
+	msgtype = pq_getmsgbyte(&msg);
+	switch (msgtype)
+	{
+		case 'E':
+		case 'N':
+			{
+				ErrorData	edata;
+				pq_parse_errornotice(&msg, &edata);
+				ereport(LOG, (errmsg("cron job " INT64_FORMAT " ERROR: %s",
+									 jobid, edata.message)));
+				break;
+			}
+		case 'T':
+			{
+				int16	natts = pq_getmsgint(&msg, 2);
+				//ereport(LOG,(errmsg("BDT count avec T est %d",natts)));
+				break;
+			}
+		case 'C':
+			{
+				const char  *tag = pq_getmsgstring(&msg);
+				const char *cmdTuples = pg_cron_cmdTuples(tag);
+
+				ereport(LOG, (errmsg("cron job " INT64_FORMAT " COMMAND completed: %s %s",
+													 jobid, tag, cmdTuples)));
+				break;
+			}
+		case 'A':
+		case 'D':
+		case 'G':
+		case 'H':
+		case 'W':
+		case 'Z':
+				break;
+		default:
+				elog(WARNING, "unknown message type: %c (%zu bytes)",
+					 msg.data[0], nbytes);
+				break;
+	}
+}
+
 /*
  * Background worker logic.
  */
@@ -1474,6 +1621,7 @@ CronBackgroundWorker(Datum main_arg)
 	char *command;
 	shm_mq *mq;
 	shm_mq_handle *responseq;
+	pg_cron_fixed_data *fdata;
 
 	pqsignal(SIGTERM, pg_cron_background_worker_sigterm);
 	BackgroundWorkerUnblockSignals();
@@ -1502,6 +1650,7 @@ CronBackgroundWorker(Datum main_arg)
 	database = shm_toc_lookup(toc, PG_CRON_KEY_DATABASE, false);
 	username = shm_toc_lookup(toc, PG_CRON_KEY_USERNAME, false);
 	command = shm_toc_lookup(toc, PG_CRON_KEY_COMMAND, false);
+	fdata = shm_toc_lookup(toc, PG_CRON_KEY_FDATA, false);
 	mq = shm_toc_lookup(toc, PG_CRON_KEY_QUEUE, false);
 
 	shm_mq_set_sender(mq, MyProc);
@@ -1521,8 +1670,11 @@ CronBackgroundWorker(Datum main_arg)
 		disable_timeout(STATEMENT_TIMEOUT, false);
 
 	/* Execute the query. */
-	ExecuteSqlString(command);
+	//ereport(LOG, (errmsg("BDT on va executer query pour job " INT64_FORMAT, fdata->jobid)));
+	ExecuteSqlString(command, fdata->jobid);
 
+	// BDT
+	//GetBackgroundWorkerFeedback(responseq);
 	/* Post-execution cleanup. */
 	disable_timeout(STATEMENT_TIMEOUT, false);
 	CommitTransactionCommand();
@@ -1531,17 +1683,19 @@ CronBackgroundWorker(Datum main_arg)
 	pgstat_report_stat(true);
 
 	/* Signal that we are done. */
+	//ereport(LOG,(errmsg("BDT avant ReadyForQuery")));
 	ReadyForQuery(DestRemote);
+	//ereport(LOG,(errmsg("BDT apres ReadyForQuery")));
 
 	dsm_detach(seg);
-	proc_exit(1);
+	proc_exit(0);
 }
 
 /*
  * Execute given SQL string without SPI or a libpq session.
  */
 static void
-ExecuteSqlString(const char *sql)
+ExecuteSqlString(const char *sql, int64 jobid)
 {
 	List *raw_parsetree_list;
 	ListCell *lc1;
@@ -1617,6 +1771,7 @@ ExecuteSqlString(const char *sql)
 		#else
 			commandTag = CreateCommandTag(parsetree->stmt);
 		#endif
+
 
 		#if PG_VERSION_NUM < 130000
 			set_ps_display(commandTag, false);
@@ -1699,6 +1854,20 @@ ExecuteSqlString(const char *sql)
 		#endif
 
 		/* Clean up the receiver. */
+		//ereport(LOG,(errmsg("BDT we executed: %s",portal->sourceText)));
+		if (portal->queryDesc != NULL) {
+			char *rowString = ngettext("row", "rows",
+							   portal->queryDesc->estate->es_processed);
+
+			ereport(LOG, (errmsg("cron job " INT64_FORMAT " completed: "
+										 "%d %s",
+										 jobid, portal->queryDesc->estate->es_processed,
+										 rowString)));
+		}
+		//ereport(LOG,(errmsg("BDT we executed: %s and it processed %ld",portal->sourceText,portal->portalPos)));
+		//	ereport(LOG,(errmsg("BDT querydesc we executed: %s and it processed %ld",portal->sourceText,portal->queryDesc->estate->es_processed)));
+		
+		ereport(LOG,(errmsg("BDT avec commandtag: %s",commandTag)));
 		(*receiver->rDestroy) (receiver);
 
 		/*
